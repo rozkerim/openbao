@@ -375,9 +375,9 @@ func (b *SystemBackend) handleRaftBootstrapAnswerWrite() framework.OperationFunc
 
 		switch nonVoter {
 		case true:
-			err = errors.New("adding non voting peer is not allowed")
+			err = raftBackend.AddPeer(ctx, serverID, clusterAddr, false)
 		default:
-			err = raftBackend.AddPeer(ctx, serverID, clusterAddr)
+			err = raftBackend.AddPeer(ctx, serverID, clusterAddr, true)
 		}
 		if err != nil {
 			if added {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"strconv"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	autopilot "github.com/hashicorp/raft-autopilot"
 	"github.com/mitchellh/mapstructure"
 	"github.com/openbao/openbao/api/v2"
+	"github.com/openbao/openbao/sdk/v2/physical"
 	"go.uber.org/atomic"
 )
 
@@ -29,6 +31,9 @@ const (
 	CleanupDeadServersUnset CleanupDeadServersValue = 0
 	CleanupDeadServersTrue  CleanupDeadServersValue = 1
 	CleanupDeadServersFalse CleanupDeadServersValue = 2
+
+	// NonVoterPath is the path to the non-voters in the storage.
+	NonVoterPath = "autopilot/non-voters"
 )
 
 func (c CleanupDeadServersValue) Value() bool {
@@ -263,22 +268,29 @@ type Delegate struct {
 	*RaftBackend
 
 	// dl is a lock dedicated for guarding delegate's fields
-	dl               sync.RWMutex
-	inflightRemovals map[raft.ServerID]bool
-	emptyVersionLogs map[raft.ServerID]struct{}
+	dl                 sync.RWMutex
+	inflightRemovals   map[raft.ServerID]bool
+	emptyVersionLogs   map[raft.ServerID]struct{}
+	permanentNonVoters map[raft.ServerID]bool
 }
 
 func NewDelegate(b *RaftBackend) *Delegate {
 	return &Delegate{
-		RaftBackend:      b,
-		inflightRemovals: make(map[raft.ServerID]bool),
-		emptyVersionLogs: make(map[raft.ServerID]struct{}),
+		RaftBackend:        b,
+		inflightRemovals:   make(map[raft.ServerID]bool),
+		emptyVersionLogs:   make(map[raft.ServerID]struct{}),
+		permanentNonVoters: make(map[raft.ServerID]bool),
 	}
 }
 
 // AutopilotConfig is called by the autopilot library to know the desired
 // autopilot configuration.
 func (d *Delegate) AutopilotConfig() *autopilot.Config {
+	// Always fetch non-voters before returning the config
+	err := d.FetchNonVoters()
+	if err != nil {
+		d.logger.Error("failed to fetch non-voters", "error", err)
+	}
 	d.l.RLock()
 	config := &autopilot.Config{
 		CleanupDeadServers:      d.autopilotConfig.CleanupDeadServers,
@@ -286,7 +298,7 @@ func (d *Delegate) AutopilotConfig() *autopilot.Config {
 		MaxTrailingLogs:         d.autopilotConfig.MaxTrailingLogs,
 		MinQuorum:               d.autopilotConfig.MinQuorum,
 		ServerStabilizationTime: d.autopilotConfig.ServerStabilizationTime,
-		Ext:                     nil,
+		Ext:                     d.permanentNonVoters,
 	}
 	d.l.RUnlock()
 	return config
@@ -414,6 +426,8 @@ func (d *Delegate) KnownServers() map[raft.ServerID]*autopilot.Server {
 		// It shouldn't be a voter and end up in this state.
 		if apServerState, found := apServerStates[raft.ServerID(id)]; found && apServerState.Server.NodeType != "" {
 			server.NodeType = apServerState.Server.NodeType
+		} else if d.IsNonVoter(raft.ServerID(id)) {
+			server.NodeType = autopilot.NodeType("non-voter")
 		} else if state.DesiredSuffrage == "voter" {
 			server.NodeType = autopilot.NodeVoter
 		}
@@ -479,6 +493,11 @@ func (d *Delegate) RemoveFailedServer(server *autopilot.Server) {
 			return
 		}
 
+		// remove failed server from non-voters
+		err := d.RemoveNonVoter(server.ID)
+		if err != nil {
+			d.logger.Error("failed to remove server from non-voters", "server_id", server.ID, "error", err)
+		}
 		d.followerStates.Delete(string(server.ID))
 	}()
 }
@@ -781,10 +800,13 @@ func (b *RaftBackend) SetupAutopilot(ctx context.Context, storageConfig *Autopil
 	// Merge the setting provided over the API
 	b.autopilotConfig.Merge(storageConfig)
 
+	// Create the autopilot delegate
+	b.delegate = NewDelegate(b)
+
 	// Create the autopilot instance
 	options := []autopilot.Option{
 		autopilot.WithLogger(b.logger),
-		autopilot.WithPromoter(autopilot.DefaultPromoter()),
+		autopilot.WithPromoter(&CustomPromoter{}),
 	}
 	if b.autopilotReconcileInterval != 0 {
 		options = append(options, autopilot.WithReconcileInterval(b.autopilotReconcileInterval))
@@ -792,7 +814,7 @@ func (b *RaftBackend) SetupAutopilot(ctx context.Context, storageConfig *Autopil
 	if b.autopilotUpdateInterval != 0 {
 		options = append(options, autopilot.WithUpdateInterval(b.autopilotUpdateInterval))
 	}
-	b.autopilot = autopilot.New(b.raft, NewDelegate(b), options...)
+	b.autopilot = autopilot.New(b.raft, b.delegate, options...)
 	b.followerStates = followerStates
 	b.followerHeartbeatTicker = time.NewTicker(1 * time.Second)
 
@@ -802,4 +824,74 @@ func (b *RaftBackend) SetupAutopilot(ctx context.Context, storageConfig *Autopil
 	b.autopilot.Start(ctx)
 
 	go b.startFollowerHeartbeatTracker()
+}
+
+func (d *Delegate) AddNonVoter(id raft.ServerID) error {
+	d.dl.Lock()
+	d.permanentNonVoters[id] = true
+	d.dl.Unlock()
+
+	return d.UpdateNonVoters()
+}
+
+func (d *Delegate) IsNonVoter(id raft.ServerID) bool {
+	d.dl.RLock()
+	defer d.dl.RUnlock()
+	if _, ok := d.permanentNonVoters[id]; ok {
+		return true
+	}
+	return false
+}
+
+func (d *Delegate) RemoveNonVoter(id raft.ServerID) error {
+	d.dl.Lock()
+	delete(d.permanentNonVoters, id)
+	d.dl.Unlock()
+
+	return d.UpdateNonVoters()
+}
+
+func (d *Delegate) UpdateNonVoters() error {
+	d.dl.RLock()
+	defer d.dl.RUnlock()
+	d.logger.Debug("updating non-voters", "non_voters", d.permanentNonVoters)
+	v, err := json.Marshal(d.permanentNonVoters)
+	if err != nil {
+		return err
+	}
+	e := physical.Entry{
+		Key:   NonVoterPath,
+		Value: v,
+	}
+
+	return d.Put(context.Background(), &e)
+}
+
+func (d *Delegate) FetchNonVoters() error {
+	e, err := d.Get(context.Background(), NonVoterPath)
+	if err != nil {
+		d.logger.Error("failed to fetch non voters", "error", err)
+		return err
+	}
+
+	if e == nil {
+		d.logger.Debug("no non-voters")
+		return nil
+	}
+
+	var nonVoters map[raft.ServerID]bool
+	if err := json.Unmarshal(e.Value, &nonVoters); err != nil {
+		d.logger.Error("failed to unmarshal non-voters", "error", err)
+		return err
+	}
+
+	d.dl.RLock()
+	nV := d.permanentNonVoters
+	d.dl.RUnlock()
+	if !maps.Equal(nV, nonVoters) {
+		d.dl.Lock()
+		d.permanentNonVoters = nonVoters
+		d.dl.Unlock()
+	}
+	return nil
 }
